@@ -1,7 +1,8 @@
-import React, { useMemo, useState } from 'react';
+import React, { useEffect, useMemo, useState } from 'react';
 import { SafeAreaView, ScrollView, View, Text, TextInput, Pressable, StyleSheet, useWindowDimensions } from 'react-native';
 import { initialEvents, FestivalEvent, EventStatus } from './src/data';
 import { theme as c } from './src/theme';
+import { client } from './src/amplify';
 
 type Page = 'dashboard' | 'events' | 'form';
 const stages = ['MAIN STAGE', 'GARDEN', 'WAREHOUSE', 'RIVER STAGE'];
@@ -42,17 +43,80 @@ export default function App() {
   const [status,setStatus] = useState<EventStatus>('CONFIRMED');
   const [notice,setNotice] = useState('');
 
+  useEffect(() => {
+    let active = true;
+    const loadEvents = async () => {
+      try {
+        const { data, errors } = await client.models.Event.list();
+        if (errors?.length) throw new Error(errors.map(error => error.message).join(', '));
+        if (!active) return;
+        if (data.length > 0) {
+          setEvents(data.map(event => ({
+            id: event.id,
+            artist: event.artist,
+            space: event.space,
+            time: event.time,
+            status: event.status as EventStatus,
+          })));
+          return;
+        }
+        await Promise.all(initialEvents.map(event => client.models.Event.create(event)));
+      } catch (error) {
+        if (active) setNotice(`No se pudieron cargar los eventos: ${error instanceof Error ? error.message : 'error desconocido'}`);
+      }
+    };
+    void loadEvents();
+    return () => { active = false; };
+  }, []);
+
   const filtered = useMemo(() => events.filter(e => (filter === 'TODOS' || e.space === filter) && (e.artist.toLowerCase().includes(search.toLowerCase()) || e.id.toLowerCase().includes(search.toLowerCase()))),[events,search,filter]);
   const openNew = () => {setEditing(null);setArtist('');setSpace(stages[0]);setTime('21:45');setStatus('CONFIRMED');setNotice('');setPage('form');};
   const openEdit = (e: FestivalEvent) => {setEditing(e.id);setArtist(e.artist);setSpace(e.space);setTime(e.time);setStatus(e.status);setNotice('');setPage('form');};
-  const save = () => {
+  const save = async () => {
     if(!artist.trim() || !/^([01]\d|2[0-3]):[0-5]\d$/.test(time)){setNotice('Introduce un artista y una hora válida (HH:MM).');return;}
-    if(editing){setEvents(v => v.map(e => e.id === editing ? {...e,artist:artist.trim().toUpperCase(),space,time,status} : e));setNotice('Evento actualizado (datos locales).');}
-    else {const id='EVT-'+Date.now().toString().slice(-7);setEvents(v=>[{id,artist:artist.trim().toUpperCase(),space,time,status},...v]);setNotice('Evento creado (datos locales).');}
-    setPage('events');
+    const event = { artist: artist.trim().toUpperCase(), space, time, status };
+    try {
+      if(editing){
+        const { errors } = await client.models.Event.update({ id: editing, ...event });
+        if (errors?.length) throw new Error(errors.map(error => error.message).join(', '));
+        setEvents(v => v.map(e => e.id === editing ? {...e, ...event} : e));
+        setNotice('Evento actualizado en DynamoDB.');
+      } else {
+        const id='EVT-'+Date.now().toString().slice(-7);
+        const { data, errors } = await client.models.Event.create({ id, ...event });
+        if (errors?.length) throw new Error(errors.map(error => error.message).join(', '));
+        if (!data) throw new Error('DynamoDB no devolvió el evento creado.');
+        setEvents(v=>[{id:data.id,artist:data.artist,space:data.space,time:data.time,status:data.status as EventStatus},...v]);
+        setNotice('Evento creado en DynamoDB.');
+      }
+      setPage('events');
+    } catch (error) {
+      setNotice(`No se pudo guardar el evento: ${error instanceof Error ? error.message : 'error desconocido'}`);
+    }
   };
-  const changeStatus = (id:string) => {setEvents(v=>v.map(e=>e.id===id?{...e,status:e.status==='CONFIRMED'?'DELAYED':e.status==='DELAYED'?'CANCELLED':'CONFIRMED'}:e));setNotice('Estado actualizado localmente.');};
-  const remove = (id:string) => {setEvents(v=>v.filter(e=>e.id!==id));setNotice('Evento eliminado localmente.');};
+  const changeStatus = async (id:string) => {
+    const event = events.find(item => item.id === id);
+    if (!event) return;
+    const nextStatus = event.status === 'CONFIRMED' ? 'DELAYED' : event.status === 'DELAYED' ? 'CANCELLED' : 'CONFIRMED';
+    try {
+      const { errors } = await client.models.Event.update({ id, status: nextStatus });
+      if (errors?.length) throw new Error(errors.map(error => error.message).join(', '));
+      setEvents(v=>v.map(e=>e.id===id?{...e,status:nextStatus}:e));
+      setNotice('Estado actualizado en DynamoDB.');
+    } catch (error) {
+      setNotice(`No se pudo actualizar el estado: ${error instanceof Error ? error.message : 'error desconocido'}`);
+    }
+  };
+  const remove = async (id:string) => {
+    try {
+      const { errors } = await client.models.Event.delete({ id });
+      if (errors?.length) throw new Error(errors.map(error => error.message).join(', '));
+      setEvents(v=>v.filter(e=>e.id!==id));
+      setNotice('Evento eliminado de DynamoDB.');
+    } catch (error) {
+      setNotice(`No se pudo eliminar el evento: ${error instanceof Error ? error.message : 'error desconocido'}`);
+    }
+  };
   const confirmed = events.filter(e=>e.status==='CONFIRMED').length;
   const delayed = events.filter(e=>e.status==='DELAYED').length;
   return <SafeAreaView style={s.root}>
@@ -68,7 +132,7 @@ export default function App() {
       <View style={s.hero}>
         <Text style={s.heroTag}>ZARAGOZA · FESTIVAL OPERATIONS</Text>
         <Text style={[s.heroTitle,wide&&{fontSize:62}]}>THE NIGHT{ '\n' }IS YOURS.</Text>
-        <Text style={s.heroSub}>Gestiona la programación en tiempo real. Demo interactiva sin backend.</Text>
+        <Text style={s.heroSub}>Gestiona la programación en tiempo real. Datos sincronizados con DynamoDB.</Text>
       </View>
       {page==='dashboard' && <>
         <Text style={s.section}>PANEL DE CONTROL</Text>
@@ -107,7 +171,7 @@ export default function App() {
         </View>
       </>}
       {!!notice && <Text accessibilityRole="alert" style={s.notice}>{notice}</Text>}
-      <View style={s.footer}><Text style={s.footerText}>FESTIVAL CONTROL · FRONTEND DEMO · REACT NATIVE + EXPO</Text><Text style={s.footerText}>NO BACKEND · NO HTTP · NO PERSISTENCIA</Text></View>
+      <View style={s.footer}><Text style={s.footerText}>FESTIVAL CONTROL · REACT NATIVE + EXPO</Text><Text style={s.footerText}>AWS AMPLIFY · DYNAMODB · API KEY DE DEMO</Text></View>
     </ScrollView>
   </SafeAreaView>;
 }
